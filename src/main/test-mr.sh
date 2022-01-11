@@ -4,10 +4,13 @@
 # basic map-reduce test
 #
 
-#RACE=
+RACE=
 
-# comment this to run the tests without the Go race detector.
-RACE=-race
+if [ "$OSTYPE" != "darwin" ]
+then
+  # comment this out to run the tests without the Go race detector.
+  RACE=-race
+fi
 
 # run the test in a fresh sub-directory.
 rm -rf mr-tmp
@@ -16,6 +19,8 @@ cd mr-tmp || exit 1
 rm -f mr-*
 
 # make sure software is freshly built.
+(cd ../../mrapps && go clean)
+(cd .. && go clean)
 (cd ../../mrapps && go build $RACE -buildmode=plugin wc.go) || exit 1
 (cd ../../mrapps && go build $RACE -buildmode=plugin indexer.go) || exit 1
 (cd ../../mrapps && go build $RACE -buildmode=plugin mtiming.go) || exit 1
@@ -185,21 +190,37 @@ rm -f mr-*
 
 echo '***' Starting early exit test.
 
-timeout -k 2s 180s ../mrcoordinator ../pg*txt &
+DF=anydone$$
+rm -f $DF
+
+(timeout -k 2s 180s ../mrcoordinator ../pg*txt ; touch $DF) &
 
 # give the coordinator time to create the sockets.
 sleep 1
 
 # start multiple workers.
-timeout -k 2s 180s ../mrworker ../../mrapps/early_exit.so &
-timeout -k 2s 180s ../mrworker ../../mrapps/early_exit.so &
-timeout -k 2s 180s ../mrworker ../../mrapps/early_exit.so &
+(timeout -k 2s 180s ../mrworker ../../mrapps/early_exit.so ; touch $DF) &
+(timeout -k 2s 180s ../mrworker ../../mrapps/early_exit.so ; touch $DF) &
+(timeout -k 2s 180s ../mrworker ../../mrapps/early_exit.so ; touch $DF) &
 
-# wait for any of the coord or workers to exit
+# wait for any of the coord or workers to exit.
 # `jobs` ensures that any completed old processes from other tests
-# are not waited upon
+# are not waited upon.
 jobs &> /dev/null
-wait -n
+if [ "$OSTYPE" = "darwin" ]
+then
+  # bash on the Mac doesn't have wait -n
+  while [ ! -e $DF ]
+  do
+    sleep 0.2
+  done
+else
+  # the -n causes wait to wait for just one child process,
+  # rather than waiting for all to finish.
+  wait -n
+fi
+
+rm -f $DF
 
 # a process has exited. this means that the output should be finalized
 # otherwise, either a worker or the coordinator exited early
