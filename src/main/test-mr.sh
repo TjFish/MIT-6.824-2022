@@ -19,6 +19,25 @@ then
   fi
 fi
 
+TIMEOUT=timeout
+if timeout 2s sleep 1 > /dev/null 2>&1
+then
+  :
+else
+  if gtimeout 2s sleep 1 > /dev/null 2>&1
+  then
+    TIMEOUT=gtimeout
+  else
+    # no timeout command
+    TIMEOUT=
+    echo '*** Cannot find timeout command; proceeding anyway.'
+  fi
+fi
+if [ "$TIMEOUT" != "" ]
+then
+  TIMEOUT+=" -k 2s 180s "
+fi
+
 # run the test in a fresh sub-directory.
 rm -rf mr-tmp
 mkdir mr-tmp || exit 1
@@ -52,16 +71,16 @@ rm -f mr-out*
 
 echo '***' Starting wc test.
 
-timeout -k 2s 180s ../mrcoordinator ../pg*txt &
+$TIMEOUT ../mrcoordinator ../pg*txt &
 pid=$!
 
 # give the coordinator time to create the sockets.
 sleep 1
 
 # start multiple workers.
-timeout -k 2s 180s ../mrworker ../../mrapps/wc.so &
-timeout -k 2s 180s ../mrworker ../../mrapps/wc.so &
-timeout -k 2s 180s ../mrworker ../../mrapps/wc.so &
+$TIMEOUT ../mrworker ../../mrapps/wc.so &
+$TIMEOUT ../mrworker ../../mrapps/wc.so &
+$TIMEOUT ../mrworker ../../mrapps/wc.so &
 
 # wait for the coordinator to exit.
 wait $pid
@@ -92,12 +111,12 @@ rm -f mr-out*
 
 echo '***' Starting indexer test.
 
-timeout -k 2s 180s ../mrcoordinator ../pg*txt &
+$TIMEOUT ../mrcoordinator ../pg*txt &
 sleep 1
 
 # start multiple workers
-timeout -k 2s 180s ../mrworker ../../mrapps/indexer.so &
-timeout -k 2s 180s ../mrworker ../../mrapps/indexer.so
+$TIMEOUT ../mrworker ../../mrapps/indexer.so &
+$TIMEOUT ../mrworker ../../mrapps/indexer.so
 
 sort mr-out* | grep . > mr-indexer-all
 if cmp mr-indexer-all mr-correct-indexer.txt
@@ -116,11 +135,11 @@ echo '***' Starting map parallelism test.
 
 rm -f mr-*
 
-timeout -k 2s 180s ../mrcoordinator ../pg*txt &
+$TIMEOUT ../mrcoordinator ../pg*txt &
 sleep 1
 
-timeout -k 2s 180s ../mrworker ../../mrapps/mtiming.so &
-timeout -k 2s 180s ../mrworker ../../mrapps/mtiming.so
+$TIMEOUT ../mrworker ../../mrapps/mtiming.so &
+$TIMEOUT ../mrworker ../../mrapps/mtiming.so
 
 NT=`cat mr-out* | grep '^times-' | wc -l | sed 's/ //g'`
 if [ "$NT" != "2" ]
@@ -147,11 +166,11 @@ echo '***' Starting reduce parallelism test.
 
 rm -f mr-*
 
-timeout -k 2s 180s ../mrcoordinator ../pg*txt &
+$TIMEOUT ../mrcoordinator ../pg*txt &
 sleep 1
 
-timeout -k 2s 180s ../mrworker ../../mrapps/rtiming.so &
-timeout -k 2s 180s ../mrworker ../../mrapps/rtiming.so
+$TIMEOUT ../mrworker ../../mrapps/rtiming.so &
+$TIMEOUT ../mrworker ../../mrapps/rtiming.so
 
 NT=`cat mr-out* | grep '^[a-z] 2' | wc -l | sed 's/ //g'`
 if [ "$NT" -lt "2" ]
@@ -170,13 +189,13 @@ echo '***' Starting job count test.
 
 rm -f mr-*
 
-timeout -k 2s 180s ../mrcoordinator ../pg*txt &
+$TIMEOUT ../mrcoordinator ../pg*txt &
 sleep 1
 
-timeout -k 2s 180s ../mrworker ../../mrapps/jobcount.so &
-timeout -k 2s 180s ../mrworker ../../mrapps/jobcount.so
-timeout -k 2s 180s ../mrworker ../../mrapps/jobcount.so &
-timeout -k 2s 180s ../mrworker ../../mrapps/jobcount.so
+$TIMEOUT ../mrworker ../../mrapps/jobcount.so &
+$TIMEOUT ../mrworker ../../mrapps/jobcount.so
+$TIMEOUT ../mrworker ../../mrapps/jobcount.so &
+$TIMEOUT ../mrworker ../../mrapps/jobcount.so
 
 NT=`cat mr-out* | awk '{print $2}'`
 if [ "$NT" -ne "8" ]
@@ -200,15 +219,15 @@ echo '***' Starting early exit test.
 DF=anydone$$
 rm -f $DF
 
-(timeout -k 2s 180s ../mrcoordinator ../pg*txt ; touch $DF) &
+($TIMEOUT ../mrcoordinator ../pg*txt ; touch $DF) &
 
 # give the coordinator time to create the sockets.
 sleep 1
 
 # start multiple workers.
-(timeout -k 2s 180s ../mrworker ../../mrapps/early_exit.so ; touch $DF) &
-(timeout -k 2s 180s ../mrworker ../../mrapps/early_exit.so ; touch $DF) &
-(timeout -k 2s 180s ../mrworker ../../mrapps/early_exit.so ; touch $DF) &
+($TIMEOUT ../mrworker ../../mrapps/early_exit.so ; touch $DF) &
+($TIMEOUT ../mrworker ../../mrapps/early_exit.so ; touch $DF) &
+($TIMEOUT ../mrworker ../../mrapps/early_exit.so ; touch $DF) &
 
 # wait for any of the coord or workers to exit.
 # `jobs` ensures that any completed old processes from other tests
@@ -257,30 +276,30 @@ sort mr-out-0 > mr-correct-crash.txt
 rm -f mr-out*
 
 rm -f mr-done
-(timeout -k 2s 180s ../mrcoordinator ../pg*txt ; touch mr-done ) &
+($TIMEOUT ../mrcoordinator ../pg*txt ; touch mr-done ) &
 sleep 1
 
 # start multiple workers
-timeout -k 2s 180s ../mrworker ../../mrapps/crash.so &
+$TIMEOUT ../mrworker ../../mrapps/crash.so &
 
 # mimic rpc.go's coordinatorSock()
 SOCKNAME=/var/tmp/824-mr-`id -u`
 
 ( while [ -e $SOCKNAME -a ! -f mr-done ]
   do
-    timeout -k 2s 180s ../mrworker ../../mrapps/crash.so
+    $TIMEOUT ../mrworker ../../mrapps/crash.so
     sleep 1
   done ) &
 
 ( while [ -e $SOCKNAME -a ! -f mr-done ]
   do
-    timeout -k 2s 180s ../mrworker ../../mrapps/crash.so
+    $TIMEOUT ../mrworker ../../mrapps/crash.so
     sleep 1
   done ) &
 
 while [ -e $SOCKNAME -a ! -f mr-done ]
 do
-  timeout -k 2s 180s ../mrworker ../../mrapps/crash.so
+  $TIMEOUT ../mrworker ../../mrapps/crash.so
   sleep 1
 done
 
