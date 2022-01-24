@@ -7,7 +7,7 @@
 # comment this out to run the tests without the Go race detector.
 RACE=-race
 
-if [ "$OSTYPE" = "darwin" ]
+if [[ "$OSTYPE" = "darwin"* ]]
 then
   if go version | grep 'go1.17.[012345]'
   then
@@ -30,7 +30,7 @@ else
   else
     # no timeout command
     TIMEOUT=
-    echo '*** Cannot find timeout command; proceeding anyway.'
+    echo '*** Cannot find timeout command; proceeding without timeouts.'
   fi
 fi
 if [ "$TIMEOUT" != "" ]
@@ -233,7 +233,7 @@ sleep 1
 # `jobs` ensures that any completed old processes from other tests
 # are not waited upon.
 jobs &> /dev/null
-if [ "$OSTYPE" = "darwin" ]
+if [[ "$OSTYPE" = "darwin"* ]]
 then
   # bash on the Mac doesn't have wait -n
   while [ ! -e $DF ]
