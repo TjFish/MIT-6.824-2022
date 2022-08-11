@@ -17,6 +17,10 @@ type Ticker struct {
 	lastTime    time.Time
 }
 
+func (t *Ticker) String() string {
+	return fmt.Sprintf("{elapsedTime:%v}", t.elapsedTime)
+}
+
 func (t *Ticker) elapsed() {
 	t.elapsedTime += time.Now().Sub(t.lastTime)
 	t.lastTime = time.Now()
@@ -38,8 +42,17 @@ func Min(x, y int) int {
 	return y
 }
 
+func Max(x, y int) int {
+	if x > y {
+		return x
+	}
+	return y
+}
+
 // Debugging
-const debug = true
+const debug = false
+const info = false
+const trace = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if debug {
@@ -95,6 +108,26 @@ func init() {
 
 func Debug(topic logTopic, format string, a ...interface{}) {
 	if debug {
+		time := time.Since(debugStart).Microseconds()
+		time /= 100
+		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+		format = prefix + format
+		log.Printf(format, a...)
+	}
+}
+
+func Info(topic logTopic, format string, a ...interface{}) {
+	if info {
+		time := time.Since(debugStart).Microseconds()
+		time /= 100
+		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+		format = prefix + format
+		log.Printf(format, a...)
+	}
+}
+
+func Trace(topic logTopic, format string, a ...interface{}) {
+	if trace {
 		time := time.Since(debugStart).Microseconds()
 		time /= 100
 		prefix := fmt.Sprintf("%06d %v ", time, string(topic))

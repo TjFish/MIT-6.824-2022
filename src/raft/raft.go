@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -65,7 +66,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
-	log         []*LogEntry
+	log         *LogEntries
 
 	commitIndex int
 	lastApplied int
@@ -78,6 +79,16 @@ type Raft struct {
 
 	lock    *sync.Mutex
 	mTicker *Ticker
+
+	applyCh chan ApplyMsg
+}
+
+func (rf *Raft) String() string {
+	return fmt.Sprintf("{[%v] state:%v, currentTerm:%v, votedFor:%v, "+
+		"commitIndex:%v, lastApplied:%v, nextIndex:%v, matchIndex:%v, mTicker:%v, "+
+		"log:%+v}",
+		rf.me, rf.state, rf.currentTerm, rf.votedFor,
+		rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf.mTicker, rf.log.log)
 }
 
 type ServerState string
@@ -92,11 +103,75 @@ type RaftConfig struct {
 	heartbeatPeriods   time.Duration
 	minElectionTimeout time.Duration
 	maxElectionTimeout time.Duration
+	checkPeriods       time.Duration
 }
 
 type LogEntry struct {
+	Index   int
 	Term    int
 	Command interface{}
+}
+
+func (l *LogEntry) String() string {
+	return fmt.Sprintf("{Index:%d,Term:%d}", l.Index, l.Term)
+}
+
+type LogEntries struct {
+	log []*LogEntry
+}
+
+func makeLogEntries() *LogEntries {
+	l := &LogEntries{}
+	l.log = []*LogEntry{{0, 0, nil}}
+	return l
+}
+
+func (l *LogEntries) get(index int) *LogEntry {
+	if index >= len(l.log) {
+		return nil
+	}
+	return l.log[index]
+}
+
+func (l *LogEntries) last() *LogEntry {
+	return l.log[len(l.log)-1]
+}
+
+func (l *LogEntries) after(index int) []*LogEntry {
+	//if index == 0 {
+	//	return make([]*LogEntry, 0)
+	//}
+	copyData := make([]*LogEntry, l.last().Index-index)
+	copy(copyData, l.log[index+1:])
+	return copyData
+}
+
+func (l *LogEntries) rewrite(startIndex int, newEntrys []*LogEntry) {
+	//Debug(dDrop, "rewrite +%v, +%v, +%v", startIndex, newEntrys)
+	i := 0
+	for i = 0; i < len(newEntrys); i++ {
+		newEntry := newEntrys[i]
+		exitEntry := l.get(startIndex + i)
+		if exitEntry == nil {
+			break
+		}
+		if newEntry.Term != exitEntry.Term {
+			//entry conflicts
+			l.log = l.log[:startIndex+i]
+			break
+		}
+	}
+	if i < len(newEntrys) {
+		copyData := make([]*LogEntry, len(newEntrys))
+		copy(copyData, newEntrys)
+		l.log = append(l.log, copyData[i:]...)
+	}
+	return
+}
+
+func (l *LogEntries) append(term int, command interface{}) {
+	newEntry := &LogEntry{Term: term, Command: command, Index: len(l.log)}
+	l.log = append(l.log, newEntry)
 }
 
 // return currentTerm and whether this server
@@ -232,6 +307,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.lock.Lock()
+
+	if rf.killed() || rf.state != ILeader {
+		rf.lock.Unlock()
+		return index, term, false
+	}
+	Info(dInfo, "[%v] start %+v", rf.me, rf)
+
+	rf.log.append(rf.currentTerm, command)
+	index = rf.log.last().Index
+	term = rf.log.last().Term
+	isLeader = true
+
+	rf.lock.Unlock()
 	return index, term, isLeader
 }
 
@@ -256,24 +345,6 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) toFollower() {
-	rf.state = IFollower
-	rf.mTicker.reset()
-	rf.votedFor = -1
-}
-
-func (rf *Raft) toCandidate() {
-	rf.state = ICandidate
-}
-
-func (rf *Raft) toLeader() {
-	rf.state = ILeader
-	rf.mTicker.reset()
-	for i := 0; i < len(rf.nextIndex); i++ {
-		rf.nextIndex[i] = len(rf.log)
-	}
-}
-
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -291,17 +362,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 	rf.lock = &sync.Mutex{}
 	rf.mTicker = &Ticker{}
-	rf.toFollower()
+	rf.mTicker.reset()
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.log = makeLogEntries()
+	rf.currentTerm = 0
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.state = IFollower
+	rf.votedFor = -1
 	rf.config = &RaftConfig{
 		heartbeatPeriods:   150 * time.Millisecond,
 		minElectionTimeout: 300 * time.Millisecond,
-		maxElectionTimeout: 450 * time.Millisecond,
+		maxElectionTimeout: 600 * time.Millisecond,
+		checkPeriods:       20 * time.Millisecond,
 	}
-	rf.currentTerm = 0
-	//rf.commitIndex = 0
-	//rf.lastApplied = 0
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
@@ -309,7 +387,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.heartBeater()
-	Debug(dInfo, "Make: %d", rf.me)
+	go rf.committer()
+	go rf.applier()
+	rf.initHeartBeater()
+	rf.initLogReplicator()
+	Info(dInfo, "Make: %d", rf.me)
 	return rf
 }

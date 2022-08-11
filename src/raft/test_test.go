@@ -99,7 +99,7 @@ func TestManyElections2A(t *testing.T) {
 
 	cfg.checkOneLeader()
 
-	iters := 10
+	iters := 100
 	for ii := 1; ii < iters; ii++ {
 		// disconnect three nodes
 		i1 := rand.Int() % servers
@@ -108,6 +108,7 @@ func TestManyElections2A(t *testing.T) {
 		cfg.disconnect(i1)
 		cfg.disconnect(i2)
 		cfg.disconnect(i3)
+		Debug(dTest, "disconnect %v %v %v", i1, i2, i3)
 
 		// either the current leader should still be alive,
 		// or the remaining four should elect a new one.
@@ -116,6 +117,8 @@ func TestManyElections2A(t *testing.T) {
 		cfg.connect(i1)
 		cfg.connect(i2)
 		cfg.connect(i3)
+		Debug(dTest, "connect %v %v %v", i1, i2, i3)
+
 	}
 
 	cfg.checkOneLeader()
@@ -286,7 +289,7 @@ func TestFailAgree2B(t *testing.T) {
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
 	cfg.disconnect((leader + 1) % servers)
-
+	Debug(dTest, "disconnect")
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
 	cfg.one(102, servers-1, false)
@@ -296,6 +299,8 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.one(105, servers-1, false)
 
 	// re-connect
+	Debug(dTest, "connect")
+
 	cfg.connect((leader + 1) % servers)
 
 	// the full set of servers should preserve
@@ -587,6 +592,7 @@ func TestCount2B(t *testing.T) {
 	leader := cfg.checkOneLeader()
 
 	total1 := rpcs()
+	Info(dTest, "total1:%v", total1)
 
 	if total1 > 30 || total1 < 1 {
 		t.Fatalf("too many or few RPCs (%v) to elect initial leader\n", total1)
