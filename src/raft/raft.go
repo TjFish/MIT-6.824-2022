@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"fmt"
 	//	"bytes"
 	"sync"
@@ -113,7 +115,11 @@ type LogEntry struct {
 }
 
 func (l *LogEntry) String() string {
-	return fmt.Sprintf("{Index:%d,Term:%d}", l.Index, l.Term)
+	if trace {
+		return fmt.Sprintf("{Index:%d,Term:%d, Command:%v}", l.Index, l.Term, l.Command)
+	}
+	return fmt.Sprintf("{Index:%d, Term:%d}", l.Index, l.Term)
+
 }
 
 type LogEntries struct {
@@ -127,7 +133,7 @@ func makeLogEntries() *LogEntries {
 }
 
 func (l *LogEntries) get(index int) *LogEntry {
-	if index >= len(l.log) {
+	if index >= len(l.log) || index < 0 {
 		return nil
 	}
 	return l.log[index]
@@ -197,12 +203,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log.after(0))
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -214,17 +221,25 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []*LogEntry
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		Debug(dError, "Decode error")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = makeLogEntries()
+		for _, log := range logs {
+			rf.log.append(log.Term, log.Command)
+		}
+	}
+	Debug(dPersist, "%v, %v, %v", currentTerm, votedFor, logs)
 }
 
 //
@@ -316,6 +331,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	Info(dInfo, "[%v] start %+v", rf.me, rf)
 
 	rf.log.append(rf.currentTerm, command)
+	rf.persist()
 	index = rf.log.last().Index
 	term = rf.log.last().Term
 	isLeader = true

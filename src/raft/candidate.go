@@ -59,6 +59,7 @@ func (rf *Raft) startElection() {
 	rf.state = ICandidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.mTicker.reset()
 
 	args := &RequestVoteArgs{}
@@ -88,6 +89,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, counter *int)
 			rf.currentTerm = reply.Term
 			rf.state = IFollower
 			rf.votedFor = -1
+			rf.persist()
 			return
 		}
 
@@ -123,6 +125,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.state = IFollower
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	if args.Term < rf.currentTerm {
@@ -142,6 +145,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			rf.mTicker.reset()
+			rf.persist()
 		}
 
 	}

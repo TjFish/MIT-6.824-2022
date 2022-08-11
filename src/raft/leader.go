@@ -15,8 +15,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	//ConflictTerm  int
 }
 
 func (rf *Raft) toLeader() {
@@ -111,6 +113,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) (ok bool,
 			rf.currentTerm = reply.Term
 			rf.state = IFollower
 			rf.votedFor = -1
+			rf.persist()
 			return
 		}
 
@@ -135,10 +138,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) (ok bool,
 			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 		} else {
-			rf.nextIndex[server] = Max(args.PrevLogIndex, 1)
+			rf.nextIndex[server] = Min(args.PrevLogIndex, reply.ConflictIndex)
+			rf.nextIndex[server] = Max(rf.nextIndex[server], 1)
 			// retry
-			retryArgs := rf.newAppendEntriesArgs(server)
-			go rf.sendAppendEntries(server, retryArgs)
+			//retryArgs := rf.newAppendEntriesArgs(server)
+			//go rf.sendAppendEntries(server, retryArgs)
 		}
 	}
 	return ok, reply
@@ -154,6 +158,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.state = IFollower
 		rf.votedFor = args.LeaderId
+		rf.persist()
 	}
 
 	if args.Term < rf.currentTerm {
@@ -165,11 +170,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mTicker.reset()
 	rf.state = IFollower
 	rf.votedFor = args.LeaderId
-
+	rf.persist()
 	//rf.toFollower()
 
 	prevLog := rf.log.get(args.PrevLogIndex)
 	if prevLog == nil || prevLog.Term != args.PrevLogTerm {
+		if prevLog == nil {
+			reply.ConflictIndex = rf.log.last().Index
+		} else {
+			i := args.PrevLogIndex
+			for i = args.PrevLogIndex; i >= 0; i-- {
+				if rf.log.get(i).Term != prevLog.Term {
+					break
+				}
+			}
+			reply.ConflictIndex = i
+		}
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
@@ -178,7 +194,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//Debug(dInfo, "[%v] AppendEntries %+v %+v %+v", rf.me, prevLog, args)
 
 	rf.log.rewrite(args.PrevLogIndex+1, args.Entries)
-
+	rf.persist()
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = Min(args.LeaderCommit, rf.log.last().Index)
 	}
