@@ -82,6 +82,8 @@ const (
 	dWarn    logTopic = "WARN"
 )
 
+var enableTopic = []logTopic{dLeader, dTest, dSnap, dPersist, dTrace}
+
 // Retrieve the verbosity level from an environment variable
 func getVerbosity() int {
 	v := os.Getenv("VERBOSE")

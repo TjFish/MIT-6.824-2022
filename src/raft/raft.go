@@ -83,6 +83,9 @@ type Raft struct {
 	mTicker *Ticker
 
 	applyCh chan ApplyMsg
+
+	lastIncludedIndex int
+	lastIncludedTerm  int
 }
 
 func (rf *Raft) String() string {
@@ -115,55 +118,61 @@ type LogEntry struct {
 }
 
 func (l *LogEntry) String() string {
-	if trace {
-		return fmt.Sprintf("{Index:%d,Term:%d, Command:%v}", l.Index, l.Term, l.Command)
-	}
 	return fmt.Sprintf("{Index:%d, Term:%d}", l.Index, l.Term)
-
 }
 
 type LogEntries struct {
-	log []*LogEntry
+	log        []*LogEntry
+	startIndex int
 }
 
-func makeLogEntries() *LogEntries {
+func makeLogEntries(startIndex int) *LogEntries {
 	l := &LogEntries{}
-	l.log = []*LogEntry{{0, 0, nil}}
+	l.log = []*LogEntry{}
+	l.startIndex = startIndex
 	return l
 }
 
 func (l *LogEntries) get(index int) *LogEntry {
-	if index >= len(l.log) || index < 0 {
+	i := index - l.startIndex
+	if i >= len(l.log) || i < 0 {
 		return nil
 	}
-	return l.log[index]
+	return l.log[i]
 }
 
 func (l *LogEntries) last() *LogEntry {
 	return l.log[len(l.log)-1]
 }
 
+//return log which Index > index
 func (l *LogEntries) after(index int) []*LogEntry {
-	//if index == 0 {
-	//	return make([]*LogEntry, 0)
-	//}
 	copyData := make([]*LogEntry, l.last().Index-index)
-	copy(copyData, l.log[index+1:])
+	i := index - l.startIndex
+	copy(copyData, l.log[i+1:])
 	return copyData
 }
 
-func (l *LogEntries) rewrite(startIndex int, newEntrys []*LogEntry) {
+// return log which Index<= index
+func (l *LogEntries) before(index int) []*LogEntry {
+	i := index - l.startIndex
+	copyData := make([]*LogEntry, i+1)
+	copy(copyData, l.log[:i+1])
+	return copyData
+}
+
+func (l *LogEntries) rewrite(index int, newEntrys []*LogEntry) {
 	//Debug(dDrop, "rewrite +%v, +%v, +%v", startIndex, newEntrys)
 	i := 0
 	for i = 0; i < len(newEntrys); i++ {
 		newEntry := newEntrys[i]
-		exitEntry := l.get(startIndex + i)
+		exitEntry := l.get(index + i)
 		if exitEntry == nil {
 			break
 		}
 		if newEntry.Term != exitEntry.Term {
 			//entry conflicts
-			l.log = l.log[:startIndex+i]
+			l.log = l.before(exitEntry.Index - 1)
 			break
 		}
 	}
@@ -176,8 +185,15 @@ func (l *LogEntries) rewrite(startIndex int, newEntrys []*LogEntry) {
 }
 
 func (l *LogEntries) append(term int, command interface{}) {
-	newEntry := &LogEntry{Term: term, Command: command, Index: len(l.log)}
+	newIndex := len(l.log) + l.startIndex
+	newEntry := &LogEntry{Term: term, Command: command, Index: newIndex}
 	l.log = append(l.log, newEntry)
+}
+
+// 截取>=index的log
+func (l *LogEntries) trim(index int) {
+	l.log = l.after(index - 1)
+	l.startIndex = index
 }
 
 // return currentTerm and whether this server
@@ -207,7 +223,9 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	e.Encode(rf.log.after(0))
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	e.Encode(rf.log.before(rf.log.last().Index))
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -223,18 +241,23 @@ func (rf *Raft) readPersist(data []byte) {
 	// Example:
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var currentTerm int
-	var votedFor int
+	var currentTerm, votedFor, lastIncludedIndex, lastIncludedTerm int
 	var logs []*LogEntry
 
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&logs) != nil {
 		Debug(dError, "Decode error")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
-		rf.log = makeLogEntries()
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
+		rf.commitIndex = rf.lastIncludedIndex
+		rf.lastApplied = rf.lastIncludedIndex
+		rf.log = makeLogEntries(lastIncludedIndex)
 		for _, log := range logs {
 			rf.log.append(log.Term, log.Command)
 		}
@@ -259,48 +282,17 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.lock.Lock()
+	defer rf.lock.Unlock()
+	Info(dSnap, "[%v]before Snapshot,index:%v %v", rf.me, index, rf)
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = rf.log.get(index).Term
+	rf.log.trim(index)
+	rf.persister.SaveStateAndSnapshot(nil, snapshot)
+	rf.persist()
+	Info(dSnap, "[%v]after Snapshot index:%v  %v", rf.me, index, rf)
+	//rf.persister.SaveStateAndSnapshot(nil, snapshot)
 }
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-//func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) (ok bool, reply *RequestVoteReply) {
-//	ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
-//	if ok {
-//		// todo check term
-//		if reply.VoteGranted {
-//			rf.voteNum += 1
-//		}
-//	}
-//	return ok, reply
-//}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -384,7 +376,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.mTicker.reset()
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
-	rf.log = makeLogEntries()
+	rf.log = makeLogEntries(0)
+	rf.log.append(0, nil)
 	rf.currentTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
