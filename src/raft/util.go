@@ -12,25 +12,25 @@ func isTimeOut(lastTime time.Time, timeOut time.Duration) bool {
 	return time.Now().Sub(lastTime) > timeOut
 }
 
-type Ticker struct {
+type Timer struct {
 	elapsedTime time.Duration
 	lastTime    time.Time
 }
 
-func (t *Ticker) String() string {
+func (t *Timer) String() string {
 	return fmt.Sprintf("{elapsedTime:%v}", t.elapsedTime)
 }
 
-func (t *Ticker) elapsed() {
+func (t *Timer) elapsed() {
 	t.elapsedTime += time.Now().Sub(t.lastTime)
 	t.lastTime = time.Now()
 }
 
-func (t *Ticker) isTimeOut(timeOut time.Duration) bool {
+func (t *Timer) isTimeOut(timeOut time.Duration) bool {
 	return t.elapsedTime > timeOut
 }
 
-func (t *Ticker) reset() {
+func (t *Timer) reset() {
 	t.elapsedTime = 0
 	t.lastTime = time.Now()
 }

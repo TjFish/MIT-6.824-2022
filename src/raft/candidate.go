@@ -8,7 +8,7 @@ import (
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	electionTimeout := rf.generateRandomizedElectionTimeout()
+	electionTimeout := rf.getRandElectionTimeout()
 
 	for rf.killed() == false {
 		// Your code here to check if a leader election should
@@ -20,30 +20,29 @@ func (rf *Raft) ticker() {
 		//1. 处于Leader状态，一切正常
 		//2.1 处于Follower状态，则判断心跳是否超时
 		//2.2 处于Candidate状态，则判断选举是否超时
-		rf.lock.Lock()
-		rf.mTicker.elapsed()
+		rf.mu.Lock()
+		rf.electionTimer.elapsed()
 
 		//Debug(dLeader, "electionTimeout %v", electionTimeout)
-		if rf.state == ILeader {
-			rf.mTicker.reset()
+		if rf.role == ILeader {
+			rf.electionTimer.reset()
 		}
 
-		if rf.state == IFollower || rf.state == ICandidate {
-			//计时器超时，开始选举
-			if rf.mTicker.isTimeOut(electionTimeout) {
+		if rf.role == IFollower || rf.role == ICandidate {
+			if rf.electionTimer.isTimeOut(electionTimeout) {
 				rf.startElection()
-				electionTimeout = rf.generateRandomizedElectionTimeout()
+				electionTimeout = rf.getRandElectionTimeout()
 			}
 		}
 
-		rf.lock.Unlock()
-		time.Sleep(electionTimeout / 3)
+		rf.mu.Unlock()
+		time.Sleep(CheckPeriods)
 	}
 }
 
-func (rf *Raft) generateRandomizedElectionTimeout() time.Duration {
-	randRange := rf.config.maxElectionTimeout - rf.config.minElectionTimeout
-	return rf.config.minElectionTimeout + time.Duration(rand.Intn(int(randRange)))
+func (rf *Raft) getRandElectionTimeout() time.Duration {
+	randRange := MaxElectionTimeout - MinElectionTimeout
+	return MinElectionTimeout + time.Duration(rand.Intn(int(randRange)))
 }
 
 //On conversion to candidate, start election:
@@ -56,57 +55,58 @@ func (rf *Raft) generateRandomizedElectionTimeout() time.Duration {
 //• If election timeout elapses: start new election
 func (rf *Raft) startElection() {
 	Info(dInfo, "[%v] startElection, %+v", rf.me, rf)
-	rf.state = ICandidate
+	rf.role = ICandidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.persist()
-	rf.mTicker.reset()
+	rf.electionTimer.reset()
 
-	args := &RequestVoteArgs{}
-	args.Term = rf.currentTerm
-	args.CandidateId = rf.me
-	args.LastLogIndex = rf.log.last().Index
-	args.LastLogTerm = rf.log.last().Term
-	counter := 1
+	args := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: rf.log.last().Index,
+		LastLogTerm:  rf.log.last().Term,
+	}
+	//得票数
+	grantedCount := 1
 	for i, _ := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		go rf.sendRequestVote(i, args, &counter)
+		go rf.sendRequestVote(i, args, &grantedCount)
 	}
 }
 
 // 这个协程目的是向指定的server发送RequestVote RPC消息，并处理其回复
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, counter *int) (ok bool, reply *RequestVoteReply) {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, grantedCount *int) (ok bool, reply *RequestVoteReply) {
 	reply = &RequestVoteReply{}
 	Trace(dVote, "[%v]sendRequestVote [%v], %+v", rf.me, server, args)
 	ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
-	rf.lock.Lock()
-	defer rf.lock.Unlock()
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//处理RPC回复
 	if ok {
 		majority := len(rf.peers)/2 + 1
+		// 公共检查
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
-			rf.state = IFollower
+			rf.role = IFollower
 			rf.votedFor = -1
 			rf.persist()
 			return
 		}
 
-		// 过期消息，自身状态已经改变
-		if rf.currentTerm != args.Term {
-			return
-		}
-
-		// 不是Candidate，说明要么成为了Leader，要么是Follower，这次选举结束
-		if rf.state != ICandidate {
+		// 任期已经改变，此次选举结束
+		// 本身状态不是Candidate，说明要么成为了Leader，要么是Follower，此次选举结束
+		if rf.currentTerm != args.Term || rf.role != ICandidate {
 			return
 		}
 
 		//处理消息回复
 		if reply.VoteGranted {
-			*counter = *counter + 1
-			if *counter >= majority {
+			*grantedCount = *grantedCount + 1
+			if *grantedCount >= majority {
 				rf.toLeader()
 			}
 		}
@@ -117,13 +117,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, counter *int)
 // RequestVote RPC handle
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.lock.Lock()
-	defer rf.lock.Unlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	defer Trace(dVote, "[%v]RequestVote from [%v], %+v, %+v", rf.me, args.CandidateId, args, reply, rf)
 
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.state = IFollower
+		rf.role = IFollower
 		rf.votedFor = -1
 		rf.persist()
 	}
@@ -144,7 +144,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			(lastEntry.Term == args.LastLogTerm && lastEntry.Index <= args.LastLogIndex) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-			rf.mTicker.reset()
+			rf.electionTimer.reset()
 			rf.persist()
 		}
 

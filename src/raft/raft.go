@@ -57,7 +57,7 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.Mutex          // Lock to protect shared access to this peer's role
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -76,40 +76,37 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	config *RaftConfig
-	state  ServerState
-
-	lock    *sync.Mutex
-	mTicker *Ticker
-
-	applyCh chan ApplyMsg
-
 	lastIncludedIndex int
 	lastIncludedTerm  int
+
+	role          Role // 当前状态
+	electionTimer *Timer
+
+	applyCh chan ApplyMsg
 }
 
 func (rf *Raft) String() string {
-	return fmt.Sprintf("{[%v] state:%v, currentTerm:%v, votedFor:%v, "+
-		"commitIndex:%v, lastApplied:%v, nextIndex:%v, matchIndex:%v, mTicker:%v, "+
+	return fmt.Sprintf("{[%v] role:%v, currentTerm:%v, votedFor:%v, "+
+		"commitIndex:%v, lastApplied:%v, nextIndex:%v, matchIndex:%v, electionTimer:%v, "+
 		"log:%+v}",
-		rf.me, rf.state, rf.currentTerm, rf.votedFor,
-		rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf.mTicker, rf.log.log)
+		rf.me, rf.role, rf.currentTerm, rf.votedFor,
+		rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf.electionTimer, rf.log.log)
 }
 
-type ServerState string
+type Role string
 
 const (
-	ILeader    ServerState = "Leader"
-	IFollower  ServerState = "Follower"
-	ICandidate ServerState = "Candidate"
+	ILeader    Role = "Leader"
+	IFollower  Role = "Follower"
+	ICandidate Role = "Candidate"
 )
 
-type RaftConfig struct {
-	heartbeatPeriods   time.Duration
-	minElectionTimeout time.Duration
-	maxElectionTimeout time.Duration
-	checkPeriods       time.Duration
-}
+const (
+	HeartBeatTimeout   = 150 * time.Millisecond
+	MinElectionTimeout = 300 * time.Millisecond
+	MaxElectionTimeout = 600 * time.Millisecond
+	CheckPeriods       = 20 * time.Millisecond //检查频率
+)
 
 type LogEntry struct {
 	Index   int
@@ -121,6 +118,9 @@ func (l *LogEntry) String() string {
 	return fmt.Sprintf("{Index:%d, Term:%d}", l.Index, l.Term)
 }
 
+// log[] 的缓存,具有以下几个性质
+// 1. log[0]存放 lastIncludedIndex,lastIncludedTerm 的logEntry
+// 2. last()返回最后一条logEntry
 type LogEntries struct {
 	log        []*LogEntry
 	startIndex int
@@ -161,11 +161,10 @@ func (l *LogEntries) before(index int) []*LogEntry {
 	return copyData
 }
 
-func (l *LogEntries) rewrite(index int, newEntrys []*LogEntry) {
-	//Debug(dDrop, "rewrite +%v, +%v, +%v", startIndex, newEntrys)
+func (l *LogEntries) rewrite(index int, newEntries []*LogEntry) {
 	i := 0
-	for i = 0; i < len(newEntrys); i++ {
-		newEntry := newEntrys[i]
+	for i = 0; i < len(newEntries); i++ {
+		newEntry := newEntries[i]
 		exitEntry := l.get(index + i)
 		if exitEntry == nil {
 			break
@@ -176,9 +175,9 @@ func (l *LogEntries) rewrite(index int, newEntrys []*LogEntry) {
 			break
 		}
 	}
-	if i < len(newEntrys) {
-		copyData := make([]*LogEntry, len(newEntrys))
-		copy(copyData, newEntrys)
+	if i < len(newEntries) {
+		copyData := make([]*LogEntry, len(newEntries))
+		copy(copyData, newEntries)
 		l.log = append(l.log, copyData[i:]...)
 	}
 	return
@@ -202,13 +201,25 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader = false
 	// Your code here (2A).
-	rf.lock.Lock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term = rf.currentTerm
-	if rf.state == ILeader {
+	if rf.role == ILeader {
 		isleader = true
 	}
-	rf.lock.Unlock()
 	return term, isleader
+}
+
+func (rf *Raft) getPersistData() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	e.Encode(rf.log.before(rf.log.last().Index))
+	data := w.Bytes()
+	return data
 }
 
 //
@@ -219,14 +230,7 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
-	e.Encode(rf.log.before(rf.log.last().Index))
-	data := w.Bytes()
+	data := rf.getPersistData()
 	rf.persister.SaveRaftState(data)
 }
 
@@ -234,7 +238,7 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 { // bootstrap without any role?
 		return
 	}
 	// Your code here (2C).
@@ -282,14 +286,15 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-	rf.lock.Lock()
-	defer rf.lock.Unlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	Info(dSnap, "[%v]before Snapshot,index:%v %v", rf.me, index, rf)
 	rf.lastIncludedIndex = index
 	rf.lastIncludedTerm = rf.log.get(index).Term
 	rf.log.trim(index)
-	rf.persister.SaveStateAndSnapshot(nil, snapshot)
-	rf.persist()
+	state := rf.getPersistData()
+	rf.persister.SaveStateAndSnapshot(state, snapshot)
+
 	Info(dSnap, "[%v]after Snapshot index:%v  %v", rf.me, index, rf)
 	//rf.persister.SaveStateAndSnapshot(nil, snapshot)
 }
@@ -314,10 +319,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	rf.lock.Lock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	if rf.killed() || rf.state != ILeader {
-		rf.lock.Unlock()
+	if rf.killed() || rf.role != ILeader {
 		return index, term, false
 	}
 	Info(dInfo, "[%v] start %+v", rf.me, rf)
@@ -328,7 +333,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.log.last().Term
 	isLeader = true
 
-	rf.lock.Unlock()
 	return index, term, isLeader
 }
 
@@ -353,6 +357,27 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) applier() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			logEntry := rf.log.get(rf.lastApplied)
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      logEntry.Command,
+				CommandIndex: rf.lastApplied,
+			}
+			//Info(dLog, "[%v] applier %+v %+v", rf.me, applyMsg.CommandIndex, rf)
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+			rf.mu.Lock()
+		}
+		rf.mu.Unlock()
+		time.Sleep(CheckPeriods)
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -370,10 +395,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	// Your initialization code here (2A, 2B, 2C).
 	rf.applyCh = applyCh
-	rf.lock = &sync.Mutex{}
-	rf.mTicker = &Ticker{}
-	rf.mTicker.reset()
+	rf.electionTimer = &Timer{}
+	rf.electionTimer.reset()
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.log = makeLogEntries(0)
@@ -381,25 +406,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.state = IFollower
+	rf.role = IFollower
 	rf.votedFor = -1
-	rf.config = &RaftConfig{
-		heartbeatPeriods:   150 * time.Millisecond,
-		minElectionTimeout: 300 * time.Millisecond,
-		maxElectionTimeout: 600 * time.Millisecond,
-		checkPeriods:       20 * time.Millisecond,
-	}
-	// Your initialization code here (2A, 2B, 2C).
-
-	// initialize from state persisted before a crash
+	// initialize from role persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
-	go rf.committer()
-	go rf.applier()
-	rf.initHeartBeater()
-	rf.initLogReplicator()
+	go rf.applier()        // for apply log -- all
+	go rf.ticker()         // for election -- candidate
+	go rf.committer()      // for commit log -- leader
+	rf.initHeartBeater()   // for heartBeat -- leader
+	rf.initLogReplicator() // for log replicate -- leader
 	Info(dInfo, "Make: %d", rf.me)
 	return rf
 }
