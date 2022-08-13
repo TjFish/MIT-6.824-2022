@@ -1,5 +1,5 @@
 pkg/
 api.key
 .api.key.trimmed
-.idea
+.idea/
 *-handin.tar.gz
