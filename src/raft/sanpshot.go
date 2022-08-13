@@ -1,12 +1,35 @@
 package raft
 
+// the service says it has created a snapshot that has
+// all info up to and including index. this means the
+// service no longer needs the log through (and including)
+// that index. Raft should now trim its log as much as possible.
+func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	lastIncludedIndex := index
+	lastIncludedTerm := rf.log.get(index).Term
+	rf.saveStateAndSnapshot(lastIncludedIndex, lastIncludedTerm, snapshot)
+}
+
+func (rf *Raft) saveStateAndSnapshot(lastIncludedIndex, lastIncludedTerm int, snapshot []byte) {
+	Info(dSnap, "[%v]before Snapshot,index:%v %v", rf.me, lastIncludedIndex, rf)
+	retainLogs := rf.log.after(lastIncludedIndex)
+	rf.log = makeLogCache(lastIncludedIndex, lastIncludedTerm)
+	rf.log.append(retainLogs...)
+	state := rf.getPersistData()
+	rf.persister.SaveStateAndSnapshot(state, snapshot)
+	Info(dSnap, "[%v]after Snapshot index:%v  %v", rf.me, lastIncludedIndex, rf)
+}
+
 func (rf *Raft) newInstallSnapshotArgs() (args *InstallSnapshotArgs) {
 	snapshot := rf.persister.ReadSnapshot()
 	args = &InstallSnapshotArgs{
 		Term:              rf.currentTerm,
 		LeaderId:          rf.me,
-		LastIncludedIndex: rf.lastIncludedIndex,
-		LastIncludedTerm:  rf.lastIncludedTerm,
+		LastIncludedIndex: rf.log.LastIncludedIndex,
+		LastIncludedTerm:  rf.log.LastIncludedTerm,
 		Data:              snapshot,
 		Done:              true,
 	}
@@ -69,27 +92,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	reply.Term = rf.currentTerm
 	entry := rf.log.get(args.LastIncludedIndex)
+	// 保存更新的log
 	if entry != nil && entry.Term == args.LastIncludedTerm {
-		rf.log.trim(args.LastIncludedIndex)
-		rf.persist()
+		rf.saveStateAndSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
+		rf.commitIndex = args.LastIncludedIndex
 		return
 	}
 
-	rf.log = makeLogEntries(args.LastIncludedIndex)
-	rf.log.append(args.LastIncludedTerm, nil)
+	// 抛弃掉已有log
+	rf.log = makeLogCache(args.LastIncludedIndex, args.LastIncludedTerm)
+	rf.saveStateAndSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
 	rf.commitIndex = args.LastIncludedIndex
-	rf.lastApplied = args.LastIncludedIndex
-	rf.persist()
-
-	go func() {
-		applyMsg := ApplyMsg{
-			CommandValid:  false,
-			SnapshotValid: true,
-			Snapshot:      args.Data,
-			SnapshotTerm:  args.LastIncludedTerm,
-			SnapshotIndex: args.LastIncludedIndex,
-		}
-		rf.applyCh <- applyMsg
-	}()
 	return
 }

@@ -91,7 +91,7 @@ func (rf *Raft) logReplicator(server int) {
 	for rf.killed() == false {
 		rf.mu.Lock()
 		if rf.role == ILeader {
-			if rf.nextIndex[server] <= rf.lastIncludedIndex {
+			if rf.nextIndex[server] <= rf.log.LastIncludedIndex {
 				// Install Snapshot
 				args := rf.newInstallSnapshotArgs()
 				go rf.sendInstallSnapshot(server, args)
@@ -109,9 +109,9 @@ func (rf *Raft) logReplicator(server int) {
 func (rf *Raft) newAppendEntriesArgs(server int) (args *AppendEntriesArgs) {
 	var prevLogIndex, prevLogTerm int
 	var entries []*LogEntry
-	if rf.nextIndex[server] <= rf.lastIncludedIndex {
-		prevLogIndex = rf.lastIncludedIndex
-		prevLogTerm = rf.lastIncludedTerm
+	if rf.nextIndex[server] <= rf.log.LastIncludedIndex {
+		prevLogIndex = rf.log.LastIncludedIndex
+		prevLogTerm = rf.log.LastIncludedTerm
 		entries = nil
 	} else {
 		prevLogIndex = rf.nextIndex[server] - 1
@@ -212,7 +212,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if prevLog.Term != args.PrevLogTerm {
 		i := args.PrevLogIndex
 		// 跳过一个 term,因为当前PrevLogTerm的所有log都是冲突的
-		for i = args.PrevLogIndex; i >= rf.lastIncludedIndex; i-- {
+		for i = args.PrevLogIndex; i >= rf.log.LastIncludedIndex; i-- {
 			if rf.log.get(i).Term != prevLog.Term {
 				break
 			}

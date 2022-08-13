@@ -68,16 +68,13 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
-	log         *LogEntries
+	log         *LogCache
 
 	commitIndex int
 	lastApplied int
 
 	nextIndex  []int
 	matchIndex []int
-
-	lastIncludedIndex int
-	lastIncludedTerm  int
 
 	role          Role // 当前状态
 	electionTimer *Timer
@@ -90,7 +87,7 @@ func (rf *Raft) String() string {
 		"commitIndex:%v, lastApplied:%v, nextIndex:%v, matchIndex:%v, electionTimer:%v, "+
 		"log:%+v}",
 		rf.me, rf.role, rf.currentTerm, rf.votedFor,
-		rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf.electionTimer, rf.log.log)
+		rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf.electionTimer, rf.log)
 }
 
 type Role string
@@ -118,50 +115,45 @@ func (l *LogEntry) String() string {
 	return fmt.Sprintf("{Index:%d, Term:%d}", l.Index, l.Term)
 }
 
-// log[] 的缓存,具有以下几个性质
-// 1. log[0]存放 lastIncludedIndex,lastIncludedTerm 的logEntry
-// 2. last()返回最后一条logEntry
-type LogEntries struct {
-	log        []*LogEntry
-	startIndex int
+// LogCache 具有以下几个性质
+// 1. Logs[0]存放 LastIncludedIndex,LastIncludedIndex 的logEntry
+// 2. Logs[]永远不为空，因为Logs[0]永远有值
+// 3. last()返回最后一条LogEntry
+type LogCache struct {
+	Logs              []*LogEntry
+	LastIncludedIndex int
+	LastIncludedTerm  int
 }
 
-func makeLogEntries(startIndex int) *LogEntries {
-	l := &LogEntries{}
-	l.log = []*LogEntry{}
-	l.startIndex = startIndex
+func makeLogCache(lastIncludedIndex int, lastIncludedTerm int) *LogCache {
+	l := &LogCache{}
+	l.Logs = []*LogEntry{{Index: lastIncludedIndex, Term: lastIncludedTerm, Command: nil}}
+	l.LastIncludedIndex = lastIncludedIndex
+	l.LastIncludedTerm = lastIncludedTerm
 	return l
 }
 
-func (l *LogEntries) get(index int) *LogEntry {
-	i := index - l.startIndex
-	if i >= len(l.log) || i < 0 {
+func (l *LogCache) get(index int) *LogEntry {
+	i := index - l.LastIncludedIndex
+	if i >= len(l.Logs) || i < 0 {
 		return nil
 	}
-	return l.log[i]
+	return l.Logs[i]
 }
 
-func (l *LogEntries) last() *LogEntry {
-	return l.log[len(l.log)-1]
+func (l *LogCache) last() *LogEntry {
+	return l.Logs[len(l.Logs)-1]
 }
 
-//return log which Index > index
-func (l *LogEntries) after(index int) []*LogEntry {
+//return logs which Index > index
+func (l *LogCache) after(index int) []*LogEntry {
 	copyData := make([]*LogEntry, l.last().Index-index)
-	i := index - l.startIndex
-	copy(copyData, l.log[i+1:])
+	i := index - l.LastIncludedIndex
+	copy(copyData, l.Logs[i+1:])
 	return copyData
 }
 
-// return log which Index<= index
-func (l *LogEntries) before(index int) []*LogEntry {
-	i := index - l.startIndex
-	copyData := make([]*LogEntry, i+1)
-	copy(copyData, l.log[:i+1])
-	return copyData
-}
-
-func (l *LogEntries) rewrite(index int, newEntries []*LogEntry) {
+func (l *LogCache) rewrite(index int, newEntries []*LogEntry) {
 	i := 0
 	for i = 0; i < len(newEntries); i++ {
 		newEntry := newEntries[i]
@@ -171,28 +163,20 @@ func (l *LogEntries) rewrite(index int, newEntries []*LogEntry) {
 		}
 		if newEntry.Term != exitEntry.Term {
 			//entry conflicts
-			l.log = l.before(exitEntry.Index - 1)
+			l.Logs = l.Logs[:exitEntry.Index-l.LastIncludedIndex]
 			break
 		}
 	}
 	if i < len(newEntries) {
 		copyData := make([]*LogEntry, len(newEntries))
 		copy(copyData, newEntries)
-		l.log = append(l.log, copyData[i:]...)
+		l.Logs = append(l.Logs, copyData[i:]...)
 	}
 	return
 }
 
-func (l *LogEntries) append(term int, command interface{}) {
-	newIndex := len(l.log) + l.startIndex
-	newEntry := &LogEntry{Term: term, Command: command, Index: newIndex}
-	l.log = append(l.log, newEntry)
-}
-
-// 截取>=index的log
-func (l *LogEntries) trim(index int) {
-	l.log = l.after(index - 1)
-	l.startIndex = index
+func (l *LogCache) append(newEntry ...*LogEntry) {
+	l.Logs = append(l.Logs, newEntry...)
 }
 
 // return currentTerm and whether this server
@@ -215,9 +199,7 @@ func (rf *Raft) getPersistData() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
-	e.Encode(rf.log.before(rf.log.last().Index))
+	e.Encode(rf.log)
 	data := w.Bytes()
 	return data
 }
@@ -245,28 +227,21 @@ func (rf *Raft) readPersist(data []byte) {
 	// Example:
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var currentTerm, votedFor, lastIncludedIndex, lastIncludedTerm int
-	var logs []*LogEntry
+	var currentTerm, votedFor int
+	var log *LogCache
 
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&lastIncludedIndex) != nil ||
-		d.Decode(&lastIncludedTerm) != nil ||
-		d.Decode(&logs) != nil {
+		d.Decode(&log) != nil {
 		Debug(dError, "Decode error")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
-		rf.lastIncludedIndex = lastIncludedIndex
-		rf.lastIncludedTerm = lastIncludedTerm
-		rf.commitIndex = rf.lastIncludedIndex
-		rf.lastApplied = rf.lastIncludedIndex
-		rf.log = makeLogEntries(lastIncludedIndex)
-		for _, log := range logs {
-			rf.log.append(log.Term, log.Command)
-		}
+		rf.log = log
+		rf.commitIndex = rf.log.LastIncludedIndex
+		//rf.lastApplied = rf.log.LastIncludedIndex
 	}
-	Debug(dPersist, "%v, %v, %v", currentTerm, votedFor, logs)
+	Debug(dPersist, "[%v]%v, %v, %v, %v", rf.me, currentTerm, votedFor, log, rf)
 }
 
 //
@@ -278,25 +253,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// Your code here (2D).
 
 	return true
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	Info(dSnap, "[%v]before Snapshot,index:%v %v", rf.me, index, rf)
-	rf.lastIncludedIndex = index
-	rf.lastIncludedTerm = rf.log.get(index).Term
-	rf.log.trim(index)
-	state := rf.getPersistData()
-	rf.persister.SaveStateAndSnapshot(state, snapshot)
-
-	Info(dSnap, "[%v]after Snapshot index:%v  %v", rf.me, index, rf)
-	//rf.persister.SaveStateAndSnapshot(nil, snapshot)
 }
 
 //
@@ -327,8 +283,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	Info(dInfo, "[%v] start %+v", rf.me, rf)
 
-	rf.log.append(rf.currentTerm, command)
+	newLogEntry := &LogEntry{
+		Index:   rf.log.last().Index + 1,
+		Term:    rf.currentTerm,
+		Command: command,
+	}
+	rf.log.append(newLogEntry)
 	rf.persist()
+
 	index = rf.log.last().Index
 	term = rf.log.last().Term
 	isLeader = true
@@ -357,21 +319,42 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// lastApplied初始化后，只有本线程会更新lastApplied
 func (rf *Raft) applier() {
 	for rf.killed() == false {
 		rf.mu.Lock()
-		for rf.lastApplied < rf.commitIndex {
+
+		// 根据快照更新状态，一般出现的情况有两种:
+		// 1.奔溃重启时，自己使用快照恢复
+		// 2.收到Install Snapshot RPC，安装快照
+		// 由于当前状态小于快照状态，直接更新为快照状态
+		if rf.lastApplied < rf.log.LastIncludedIndex {
+			applyMsg := ApplyMsg{
+				CommandValid:  false,
+				SnapshotValid: true,
+				Snapshot:      rf.persister.ReadSnapshot(),
+				SnapshotTerm:  rf.log.LastIncludedTerm,
+				SnapshotIndex: rf.log.LastIncludedIndex,
+			}
+			rf.lastApplied = rf.log.LastIncludedIndex
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+			continue
+		}
+
+		// 根据commitIndex更新状态
+		if rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
 			logEntry := rf.log.get(rf.lastApplied)
+			Info(dLog, "[%v] applier %+v %+v", rf.me, rf.lastApplied, rf)
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      logEntry.Command,
 				CommandIndex: rf.lastApplied,
 			}
-			//Info(dLog, "[%v] applier %+v %+v", rf.me, applyMsg.CommandIndex, rf)
 			rf.mu.Unlock()
 			rf.applyCh <- applyMsg
-			rf.mu.Lock()
+			continue
 		}
 		rf.mu.Unlock()
 		time.Sleep(CheckPeriods)
@@ -401,8 +384,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimer.reset()
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
-	rf.log = makeLogEntries(0)
-	rf.log.append(0, nil)
+	rf.log = makeLogCache(0, 0)
 	rf.currentTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -410,6 +392,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	// initialize from role persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	Info(dInfo, "[%v] Make: %v", rf)
 
 	// start ticker goroutine to start elections
 	go rf.applier()        // for apply log -- all
@@ -417,6 +400,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.committer()      // for commit log -- leader
 	rf.initHeartBeater()   // for heartBeat -- leader
 	rf.initLogReplicator() // for log replicate -- leader
-	Info(dInfo, "Make: %d", rf.me)
 	return rf
 }
