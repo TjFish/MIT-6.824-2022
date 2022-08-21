@@ -80,6 +80,12 @@ type Raft struct {
 	electionTimer *Timer
 
 	applyCh chan ApplyMsg
+
+	notifyStopCh         chan bool
+	notifyApplyCh        chan bool
+	notifyCommitCh       chan bool
+	notifyHeartBeateCh   []chan bool
+	notifyLogReplicateCh []chan bool
 }
 
 func (rf *Raft) String() string {
@@ -99,10 +105,10 @@ const (
 )
 
 const (
-	HeartBeatTimeout   = 150 * time.Millisecond
+	HeartBeateTimeout  = 150 * time.Millisecond
 	MinElectionTimeout = 300 * time.Millisecond
 	MaxElectionTimeout = 600 * time.Millisecond
-	CheckPeriods       = 10 * time.Millisecond //检查频率
+	CheckPeriods       = 20 * time.Millisecond //检查频率
 )
 
 type LogEntry struct {
@@ -290,6 +296,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.log.append(newLogEntry)
 	rf.persist()
+	//send AppendEntries RPC
+	for server, _ := range rf.peers {
+		if server == rf.me {
+			continue
+		}
+		rf.notify(rf.notifyLogReplicateCh[server])
+	}
 
 	index = rf.log.last().Index
 	term = rf.log.last().Term
@@ -312,6 +325,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	close(rf.notifyStopCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -319,45 +333,66 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// lastApplied初始化后，只有本线程会更新lastApplied
-func (rf *Raft) applier() {
-	for rf.killed() == false {
-		rf.mu.Lock()
+func (rf *Raft) notify(ch chan bool) {
+	go func() { ch <- true }()
+}
 
-		// 根据快照更新状态，一般出现的情况有两种:
-		// 1.奔溃重启时，自己使用快照恢复
-		// 2.收到Install Snapshot RPC，安装快照
-		// 由于当前状态小于快照状态，直接更新为快照状态
-		if rf.lastApplied < rf.log.LastIncludedIndex {
-			applyMsg := ApplyMsg{
-				CommandValid:  false,
-				SnapshotValid: true,
-				Snapshot:      rf.persister.ReadSnapshot(),
-				SnapshotTerm:  rf.log.LastIncludedTerm,
-				SnapshotIndex: rf.log.LastIncludedIndex,
-			}
-			rf.lastApplied = rf.log.LastIncludedIndex
-			rf.mu.Unlock()
-			rf.applyCh <- applyMsg
-			continue
+// lastApplied初始化后，只有函数会更新lastApplied
+func (rf *Raft) apply() {
+	rf.mu.Lock()
+
+	// 根据快照更新状态，一般出现的情况有两种:
+	// 1.奔溃重启时，自己使用快照恢复
+	// 2.收到Install Snapshot RPC，安装快照
+	// 由于当前状态小于快照状态，直接更新为快照状态
+	if rf.lastApplied < rf.log.LastIncludedIndex {
+		applyMsg := ApplyMsg{
+			CommandValid:  false,
+			SnapshotValid: true,
+			Snapshot:      rf.persister.ReadSnapshot(),
+			SnapshotTerm:  rf.log.LastIncludedTerm,
+			SnapshotIndex: rf.log.LastIncludedIndex,
 		}
+		rf.lastApplied = rf.log.LastIncludedIndex
+		rf.mu.Unlock()
+		rf.applyCh <- applyMsg
+		// continue
+		rf.notify(rf.notifyApplyCh)
+		return
+	}
 
-		// 根据commitIndex更新状态
-		if rf.lastApplied < rf.commitIndex {
-			rf.lastApplied++
-			logEntry := rf.log.get(rf.lastApplied)
-			Info(dLog, "[%v] applier %+v %+v", rf.me, rf.lastApplied, rf)
-			applyMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      logEntry.Command,
-				CommandIndex: rf.lastApplied,
-			}
-			rf.mu.Unlock()
-			rf.applyCh <- applyMsg
-			continue
+	// 根据commitIndex更新状态
+	if rf.lastApplied < rf.commitIndex {
+		rf.lastApplied++
+		logEntry := rf.log.get(rf.lastApplied)
+		Info(dLog, "[%v] applier %+v %+v", rf.me, rf.lastApplied, rf)
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command:      logEntry.Command,
+			CommandIndex: rf.lastApplied,
 		}
 		rf.mu.Unlock()
-		time.Sleep(CheckPeriods)
+		rf.applyCh <- applyMsg
+		// continue
+		rf.notify(rf.notifyApplyCh)
+		return
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) applier() {
+	checkTimer := time.NewTimer(CheckPeriods)
+	defer checkTimer.Stop()
+	for rf.killed() == false {
+		select {
+		case <-rf.notifyStopCh:
+			return
+		case <-checkTimer.C:
+			rf.notify(rf.notifyApplyCh)
+		case <-rf.notifyApplyCh:
+			rf.apply()
+			checkTimer.Reset(CheckPeriods)
+		}
 	}
 }
 
@@ -394,11 +429,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	Info(dInfo, "[%v] Make: %v", rf)
 
+	rf.notifyCommitCh = make(chan bool, 5)
+	rf.notifyApplyCh = make(chan bool, 5)
+	rf.notifyStopCh = make(chan bool, 5)
+	rf.notifyHeartBeateCh = make([]chan bool, len(rf.peers))
+	rf.notifyLogReplicateCh = make([]chan bool, len(rf.peers))
+	for server, _ := range rf.peers {
+		rf.notifyHeartBeateCh[server] = make(chan bool, 5)
+		rf.notifyLogReplicateCh[server] = make(chan bool, 5)
+	}
 	// start ticker goroutine to start elections
+	rf.initHeartBeater()   // for heartBeat -- leader
+	rf.initLogReplicator() // for log replicate -- leader
 	go rf.applier()        // for apply log -- all
 	go rf.ticker()         // for election -- candidate
 	go rf.committer()      // for commit log -- leader
-	rf.initHeartBeater()   // for heartBeat -- leader
-	rf.initLogReplicator() // for log replicate -- leader
+
 	return rf
 }

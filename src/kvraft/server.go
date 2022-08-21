@@ -44,10 +44,12 @@ type KVServer struct {
 	persister    *raft.Persister
 
 	// Your definitions here.
-	db             map[string]string
-	duplicateTable *DuplicateTable
-	waitHandles    map[int64]chan bool
-	lastApplied    int
+	db               map[string]string
+	duplicateTable   *DuplicateTable
+	lastApplied      int
+	notifyHandleCh   map[int64]chan bool
+	notifyStopCh     chan bool
+	notifySnapshotCh chan bool
 }
 
 // 重复检测 start
@@ -104,7 +106,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.rf.Start(op)
 
 	ch := make(chan bool, 1)
-	kv.waitHandles[op.RequestId] = ch
+	kv.notifyHandleCh[op.RequestId] = ch
 	kv.mu.Unlock()
 
 	// command 已经发出，等待raft提交
@@ -113,7 +115,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	select {
 	case <-ch: // 收到回复
 		kv.mu.Lock()
-		delete(kv.waitHandles, op.RequestId)
+		delete(kv.notifyHandleCh, op.RequestId)
 		if kv.db[args.Key] == "" {
 			reply.Err = ErrNoKey
 		} else {
@@ -123,7 +125,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	case <-waitTimer.C: // 超时
 		kv.mu.Lock()
-		delete(kv.waitHandles, op.RequestId)
+		delete(kv.notifyHandleCh, op.RequestId)
 		reply.Err = ErrTimeOut
 		return
 	}
@@ -154,7 +156,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	kv.rf.Start(op)
 	ch := make(chan bool, 1)
-	kv.waitHandles[op.RequestId] = ch
+	kv.notifyHandleCh[op.RequestId] = ch
 	kv.mu.Unlock()
 
 	// command 已经发出，等待raft提交
@@ -163,12 +165,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	select {
 	case <-ch: // 收到回复
 		kv.mu.Lock()
-		delete(kv.waitHandles, op.RequestId)
+		delete(kv.notifyHandleCh, op.RequestId)
 		reply.Err = OK
 		return
 	case <-waitTimer.C: // 超时
 		kv.mu.Lock()
-		delete(kv.waitHandles, op.RequestId)
+		delete(kv.notifyHandleCh, op.RequestId)
 		reply.Err = ErrTimeOut
 		return
 	}
@@ -202,10 +204,12 @@ func (kv *KVServer) applier() {
 				kv.duplicateTable.add(op)
 			}
 			// 唤醒等待的handle
-			ch := kv.waitHandles[op.RequestId]
-			if ch != nil {
-				ch <- true
+			waitHandle := kv.notifyHandleCh[op.RequestId]
+			if waitHandle != nil {
+				kv.notify(waitHandle)
 			}
+			// check snapshot
+			kv.notify(kv.notifySnapshotCh)
 		}
 		if msg.SnapshotValid {
 			kv.readSnapshot(msg.Snapshot)
@@ -215,25 +219,43 @@ func (kv *KVServer) applier() {
 	}
 }
 
+func (kv *KVServer) snapshot() {
+	kv.mu.Lock()
+	raftStateSize := kv.persister.RaftStateSize()
+	if raftStateSize > kv.maxraftstate && kv.maxraftstate != -1 {
+		// Snapshot
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(kv.lastApplied)
+		e.Encode(kv.duplicateTable)
+		e.Encode(kv.db)
+		snapshot := w.Bytes()
+		index := kv.lastApplied
+		kv.mu.Unlock()
+		kv.rf.Snapshot(index, snapshot)
+	} else {
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) notify(ch chan bool) {
+	go func() { ch <- true }()
+}
+
 func (kv *KVServer) snapshotChecker() {
-	for !kv.killed() {
-		kv.mu.Lock()
-		raftStateSize := kv.persister.RaftStateSize()
-		if raftStateSize > kv.maxraftstate && kv.maxraftstate != -1 {
-			// Snapshot
-			w := new(bytes.Buffer)
-			e := labgob.NewEncoder(w)
-			e.Encode(kv.lastApplied)
-			e.Encode(kv.duplicateTable)
-			e.Encode(kv.db)
-			snapshot := w.Bytes()
-			index := kv.lastApplied
-			kv.mu.Unlock()
-			kv.rf.Snapshot(index, snapshot)
-		} else {
-			kv.mu.Unlock()
+	checkTimer := time.NewTimer(CheckPeriods)
+	defer checkTimer.Stop()
+
+	for kv.killed() == false {
+		select {
+		case <-kv.notifyStopCh:
+			return
+		case <-checkTimer.C:
+			kv.notify(kv.notifySnapshotCh)
+		case <-kv.notifySnapshotCh:
+			kv.snapshot()
+			checkTimer.Reset(CheckPeriods)
 		}
-		time.Sleep(CheckPeriods)
 	}
 }
 
@@ -269,6 +291,7 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	close(kv.notifyStopCh)
 }
 
 func (kv *KVServer) killed() bool {
@@ -304,9 +327,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.duplicateTable = makeDuplicateTable()
 	kv.readSnapshot(persister.ReadSnapshot())
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.notifyStopCh = make(chan bool, 5)
+	kv.notifySnapshotCh = make(chan bool, 5)
 
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.waitHandles = make(map[int64]chan bool)
+	kv.notifyHandleCh = make(map[int64]chan bool)
 	// You may need initialization code here.
 	go kv.applier()
 	go kv.snapshotChecker()

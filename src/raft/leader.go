@@ -51,10 +51,18 @@ func (rf *Raft) toLeader() {
 		if server == rf.me {
 			continue
 		}
+		rf.notify(rf.notifyHeartBeateCh[server])
+	}
+	Info(dLeader, "[%v] i am leader%+v", rf.me, rf)
+}
+
+func (rf *Raft) heartBeate(server int) {
+	rf.mu.Lock()
+	if rf.role == ILeader {
 		args := rf.newAppendEntriesArgs(server)
 		go rf.sendAppendEntries(server, args)
 	}
-	Info(dLeader, "[%v] i am leader%+v", rf.me, rf)
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) initHeartBeater() {
@@ -67,15 +75,35 @@ func (rf *Raft) initHeartBeater() {
 }
 
 func (rf *Raft) heartBeater(server int) {
+	heartBeateTimer := time.NewTimer(HeartBeateTimeout)
+	defer heartBeateTimer.Stop()
 	for rf.killed() == false {
-		rf.mu.Lock()
-		if rf.role == ILeader {
+		select {
+		case <-rf.notifyStopCh:
+			return
+		case <-heartBeateTimer.C:
+			rf.notify(rf.notifyHeartBeateCh[server])
+		case <-rf.notifyHeartBeateCh[server]:
+			rf.heartBeate(server)
+			heartBeateTimer.Reset(HeartBeateTimeout)
+		}
+	}
+}
+
+func (rf *Raft) logReplicate(server int) {
+	rf.mu.Lock()
+	if rf.role == ILeader {
+		if rf.nextIndex[server] <= rf.log.LastIncludedIndex {
+			// Install Snapshot
+			args := rf.newInstallSnapshotArgs()
+			go rf.sendInstallSnapshot(server, args)
+		} else if rf.log.last().Index >= rf.nextIndex[server] {
+			//AppendEntries
 			args := rf.newAppendEntriesArgs(server)
 			go rf.sendAppendEntries(server, args)
 		}
-		rf.mu.Unlock()
-		time.Sleep(HeartBeatTimeout)
 	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) initLogReplicator() {
@@ -88,21 +116,18 @@ func (rf *Raft) initLogReplicator() {
 }
 
 func (rf *Raft) logReplicator(server int) {
+	checkTimer := time.NewTimer(CheckPeriods)
+	defer checkTimer.Stop()
 	for rf.killed() == false {
-		rf.mu.Lock()
-		if rf.role == ILeader {
-			if rf.nextIndex[server] <= rf.log.LastIncludedIndex {
-				// Install Snapshot
-				args := rf.newInstallSnapshotArgs()
-				go rf.sendInstallSnapshot(server, args)
-			} else if rf.log.last().Index >= rf.nextIndex[server] {
-				//AppendEntries
-				args := rf.newAppendEntriesArgs(server)
-				go rf.sendAppendEntries(server, args)
-			}
+		select {
+		case <-rf.notifyStopCh:
+			return
+		case <-checkTimer.C:
+			rf.notify(rf.notifyLogReplicateCh[server])
+		case <-rf.notifyLogReplicateCh[server]:
+			rf.logReplicate(server)
+			checkTimer.Reset(CheckPeriods)
 		}
-		rf.mu.Unlock()
-		time.Sleep(CheckPeriods)
 	}
 }
 
@@ -165,8 +190,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) (ok bool,
 		if reply.Success {
 			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+			//通知commit
+			rf.notify(rf.notifyCommitCh)
 		} else {
 			rf.nextIndex[server] = reply.ConflictIndex + 1
+			// retry
+			rf.notify(rf.notifyLogReplicateCh[server])
 			// next check to retry
 			//retryArgs := rf.newAppendEntriesArgs(server)
 			//go rf.sendAppendEntries(server, retryArgs)
@@ -212,7 +241,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if prevLog.Term != args.PrevLogTerm {
 		i := args.PrevLogIndex
 		// 跳过一个 term,因为当前PrevLogTerm的所有log都是冲突的
-		for i = args.PrevLogIndex; i >= rf.log.LastIncludedIndex; i-- {
+		for i = args.PrevLogIndex; i > rf.log.LastIncludedIndex; i-- {
 			if rf.log.get(i).Term != prevLog.Term {
 				break
 			}
@@ -230,6 +259,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.persist()
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = Min(args.LeaderCommit, rf.log.last().Index)
+		//通知commit
+		rf.notify(rf.notifyCommitCh)
 	}
 
 	reply.Success = true
@@ -238,29 +269,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	return
 }
 
-func (rf *Raft) committer() {
-	for rf.killed() == false {
-		rf.mu.Lock()
-		if rf.role == ILeader {
-			for N := rf.commitIndex + 1; N <= rf.log.last().Index; N++ {
-				majority := len(rf.peers)/2 + 1
-				counter := 1
-				for i, _ := range rf.peers {
-					if i == rf.me {
-						continue
-					}
-					if rf.matchIndex[i] >= N {
-						counter++
-					}
-				}
+func (rf *Raft) commit() {
+	rf.mu.Lock()
 
-				if counter >= majority && rf.log.get(N).Term == rf.currentTerm {
-					rf.commitIndex = N
-					//Debug(dCommit, "[%v]commitIndex %+v", rf.me, rf)
+	if rf.role == ILeader {
+		hasCommit := false
+		for N := rf.commitIndex + 1; N <= rf.log.last().Index; N++ {
+			majority := len(rf.peers)/2 + 1
+			counter := 1
+			for i, _ := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				if rf.matchIndex[i] >= N {
+					counter++
 				}
 			}
+
+			if counter >= majority && rf.log.get(N).Term == rf.currentTerm {
+				rf.commitIndex = N
+				hasCommit = true
+				//Debug(dCommit, "[%v]commitIndex %+v", rf.me, rf)
+			}
 		}
-		rf.mu.Unlock()
-		time.Sleep(CheckPeriods)
+		// 通知apply
+		if hasCommit {
+			rf.notify(rf.notifyApplyCh)
+		}
+	}
+	rf.mu.Unlock()
+
+}
+
+func (rf *Raft) committer() {
+	checkTimer := time.NewTimer(CheckPeriods)
+	defer checkTimer.Stop()
+	for rf.killed() == false {
+		select {
+		case <-rf.notifyStopCh:
+			return
+		case <-checkTimer.C:
+			rf.notify(rf.notifyCommitCh)
+		case <-rf.notifyCommitCh:
+			rf.commit()
+			checkTimer.Reset(CheckPeriods)
+		}
 	}
 }

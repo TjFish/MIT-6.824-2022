@@ -2,13 +2,16 @@
 
 MIT 6.824 2022分布式系统 课程代码实现
 
-- [x] lab1 MR
-- [x] lab2 Raft
+- [x] lab1 MapReduce
+- [x] lab2 Raft【分布式一致协议】
   - [x] 2A leader election
   - [x] 2B log 
   - [x] 2C persistence 
   - [x] 2D log compaction
-- [ ]  lab3 kvraft
+- [x] lab3 KVRaft 【基于Raft的分布式Key/Value数据库】
+  - [x] 3A Key/value service without snapshots
+  - [x] 3B Key/value service with snapshots 
+
 - [ ] lab4 shardkv
 
 ## Lab1 MapReduce的实现
@@ -24,6 +27,12 @@ MIT 6.824 2022分布式系统 课程代码实现
 测试结果
 
 ![image-20220813180523774](Readme.assets/image-20220813180523774.png)
+
+## Lab3 KVRaft实现
+
+测试结果
+
+![image-20220821232113538](Readme.assets/image-20220821232113538.png)
 
 参考资料
 
