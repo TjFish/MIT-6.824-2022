@@ -1,13 +1,18 @@
 package kvraft
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
-
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientId int64
+	seq      int64
+	leader   int
 }
 
 func nrand() int64 {
@@ -20,8 +25,19 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+	ck.clientId = nrand()
+	ck.seq = 0
+	DPrintf("MakeClerk %v", ck)
+
 	// You'll have to add code here.
 	return ck
+}
+
+func (ck *Clerk) changeLeader() {
+	ck.leader++
+	if ck.leader >= len(ck.servers) {
+		ck.leader = 0
+	}
 }
 
 //
@@ -39,7 +55,34 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	DPrintf("[%v]Client Get %+v", ck.clientId, ck)
+	ck.seq++
+	args := GetArgs{
+		Key:      key,
+		ClientId: ck.clientId,
+		Seq:      ck.seq,
+	}
+	for {
+		reply := GetReply{}
+		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
+		if ok {
+			switch reply.Err {
+			case OK:
+				return reply.Value
+			case ErrNoKey:
+				return ""
+			case ErrWrongLeader:
+				ck.changeLeader()
+			case ErrTimeOut:
+				continue
+			default:
+				continue
+			}
+		} else {
+			ck.changeLeader()
+		}
+		time.Sleep(ChangeLeaderPeriods)
+	}
 }
 
 //
@@ -54,6 +97,36 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+
+	ck.seq++
+	args := PutAppendArgs{
+		ClientId: ck.clientId,
+		Seq:      ck.seq,
+		Key:      key,
+		Value:    value,
+		Op:       op,
+	}
+	for {
+		reply := &PutAppendReply{}
+		DPrintf("[%v]->[%v]Client PutAppend %+v, %+v", ck.clientId, ck.leader, args, ck)
+		ok := ck.servers[ck.leader].Call("KVServer.PutAppend", &args, &reply)
+		if ok {
+			switch reply.Err {
+			case OK:
+				return
+			case ErrWrongLeader:
+				ck.changeLeader()
+			case ErrTimeOut:
+				continue
+			default:
+				continue
+			}
+		} else {
+			ck.changeLeader()
+		}
+		time.Sleep(ChangeLeaderPeriods)
+	}
+
 }
 
 func (ck *Clerk) Put(key string, value string) {

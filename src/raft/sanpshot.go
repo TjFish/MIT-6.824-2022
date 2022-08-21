@@ -8,6 +8,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// 已经生成过Snapshot
+	if index < rf.log.LastIncludedIndex {
+		return
+	}
 	lastIncludedIndex := index
 	lastIncludedTerm := rf.log.get(index).Term
 	rf.saveStateAndSnapshot(lastIncludedIndex, lastIncludedTerm, snapshot)

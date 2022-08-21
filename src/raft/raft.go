@@ -102,7 +102,7 @@ const (
 	HeartBeatTimeout   = 150 * time.Millisecond
 	MinElectionTimeout = 300 * time.Millisecond
 	MaxElectionTimeout = 600 * time.Millisecond
-	CheckPeriods       = 20 * time.Millisecond //检查频率
+	CheckPeriods       = 10 * time.Millisecond //检查频率
 )
 
 type LogEntry struct {

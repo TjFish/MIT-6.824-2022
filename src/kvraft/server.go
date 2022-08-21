@@ -4,9 +4,11 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -18,11 +20,17 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key       string
+	Value     string
+	Type      string
+	ClientId  int64
+	Seq       int64
+	Result    string
+	RequestId int64
 }
 
 type KVServer struct {
@@ -33,17 +41,218 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
 	// Your definitions here.
+	db             map[string]string
+	duplicateTable *DuplicateTable
+	waitHandles    map[int64]chan bool
+	lastApplied    int
 }
 
+// 重复检测 start
+type DuplicateTable struct {
+	Table map[int64]*Op
+}
+
+func makeDuplicateTable() *DuplicateTable {
+	dt := &DuplicateTable{}
+	dt.Table = make(map[int64]*Op)
+	return dt
+}
+
+func (dt *DuplicateTable) check(op Op) (isDuplicate bool, value string) {
+	duplicateOp := dt.Table[op.ClientId]
+	if duplicateOp != nil && duplicateOp.Seq == op.Seq {
+		return true, duplicateOp.Result
+	}
+	return false, ""
+}
+
+func (dt *DuplicateTable) add(op Op) {
+	dt.Table[op.ClientId] = &op
+}
+
+// 重复检测 end
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer DPrintf("[%v]Get %+v, %+v, %+v", kv.me, args, reply, kv)
+	defer kv.mu.Unlock()
+
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{Key: args.Key, Value: "", Type: "Get",
+		ClientId: args.ClientId, Seq: args.Seq,
+		RequestId: nrand(),
+	}
+
+	// 重复消息
+	isDuplicate, value := kv.duplicateTable.check(op)
+	if isDuplicate {
+		reply.Err = OK
+		reply.Value = value
+		return
+	}
+
+	// 发出command
+	kv.rf.Start(op)
+
+	ch := make(chan bool, 1)
+	kv.waitHandles[op.RequestId] = ch
+	kv.mu.Unlock()
+
+	// command 已经发出，等待raft提交
+	waitTimer := time.NewTimer(WaitCmdTimeOut)
+	defer waitTimer.Stop()
+	select {
+	case <-ch: // 收到回复
+		kv.mu.Lock()
+		delete(kv.waitHandles, op.RequestId)
+		if kv.db[args.Key] == "" {
+			reply.Err = ErrNoKey
+		} else {
+			reply.Value = kv.db[args.Key]
+			reply.Err = OK
+		}
+		return
+	case <-waitTimer.C: // 超时
+		kv.mu.Lock()
+		delete(kv.waitHandles, op.RequestId)
+		reply.Err = ErrTimeOut
+		return
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer DPrintf("[%v]PutAppend %+v, %+v, %+v", kv.me, args, reply, kv)
+	defer kv.mu.Unlock()
+
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{Key: args.Key, Value: args.Value, Type: args.Op,
+		ClientId: args.ClientId, Seq: args.Seq,
+		RequestId: nrand(),
+	}
+
+	isDuplicate, _ := kv.duplicateTable.check(op)
+	if isDuplicate {
+		reply.Err = OK
+		return
+	}
+
+	kv.rf.Start(op)
+	ch := make(chan bool, 1)
+	kv.waitHandles[op.RequestId] = ch
+	kv.mu.Unlock()
+
+	// command 已经发出，等待raft提交
+	waitTimer := time.NewTimer(WaitCmdTimeOut)
+	defer waitTimer.Stop()
+	select {
+	case <-ch: // 收到回复
+		kv.mu.Lock()
+		delete(kv.waitHandles, op.RequestId)
+		reply.Err = OK
+		return
+	case <-waitTimer.C: // 超时
+		kv.mu.Lock()
+		delete(kv.waitHandles, op.RequestId)
+		reply.Err = ErrTimeOut
+		return
+	}
+}
+
+func (kv *KVServer) applier() {
+	// Your code here.
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		kv.mu.Lock()
+		DPrintf("[%v]applier %+v, %+v", kv.me, msg, kv)
+
+		if msg.CommandValid {
+			op := (msg.Command).(Op)
+			kv.lastApplied = msg.CommandIndex
+
+			isDuplicate, _ := kv.duplicateTable.check(op)
+			if !isDuplicate {
+				switch op.Type {
+				case "Get":
+					op.Result = kv.db[op.Key]
+				case "Put":
+					kv.db[op.Key] = op.Value
+				case "Append":
+					if kv.db[op.Key] == "" {
+						kv.db[op.Key] = op.Value
+					} else {
+						kv.db[op.Key] = kv.db[op.Key] + op.Value
+					}
+				}
+				kv.duplicateTable.add(op)
+			}
+			// 唤醒等待的handle
+			ch := kv.waitHandles[op.RequestId]
+			if ch != nil {
+				ch <- true
+			}
+		}
+		if msg.SnapshotValid {
+			kv.readSnapshot(msg.Snapshot)
+		}
+		kv.mu.Unlock()
+
+	}
+}
+
+func (kv *KVServer) snapshotChecker() {
+	for !kv.killed() {
+		kv.mu.Lock()
+		raftStateSize := kv.persister.RaftStateSize()
+		if raftStateSize > kv.maxraftstate && kv.maxraftstate != -1 {
+			// Snapshot
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.lastApplied)
+			e.Encode(kv.duplicateTable)
+			e.Encode(kv.db)
+			snapshot := w.Bytes()
+			index := kv.lastApplied
+			kv.mu.Unlock()
+			kv.rf.Snapshot(index, snapshot)
+		} else {
+			kv.mu.Unlock()
+		}
+		time.Sleep(CheckPeriods)
+	}
+}
+
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var lastApplied int
+	var duplicateTable *DuplicateTable
+	var db map[string]string
+
+	if d.Decode(&lastApplied) != nil ||
+		d.Decode(&duplicateTable) != nil ||
+		d.Decode(&db) != nil {
+		DPrintf("Decode error")
+	} else {
+		kv.lastApplied = lastApplied
+		kv.duplicateTable = duplicateTable
+		kv.db = db
+	}
 }
 
 //
@@ -89,13 +298,18 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
+	kv.persister = persister
 	// You may need initialization code here.
-
+	kv.db = make(map[string]string)
+	kv.duplicateTable = makeDuplicateTable()
+	kv.readSnapshot(persister.ReadSnapshot())
 	kv.applyCh = make(chan raft.ApplyMsg)
+
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	kv.waitHandles = make(map[int64]chan bool)
 	// You may need initialization code here.
-
+	go kv.applier()
+	go kv.snapshotChecker()
+	DPrintf("[%v] StartKVServer %v", kv.me, kv)
 	return kv
 }
